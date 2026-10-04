@@ -85,16 +85,17 @@ private:
     void sendData(const uint8_t* data, size_t len);
     void sendCmdData(uint8_t cmd, std::initializer_list<uint8_t> args);
 
-    esp_err_t initController(uint8_t border_waveform);
+    esp_err_t initController(uint8_t border_waveform, bool hw_reset = true);
     void setRamArea();
     void setRamCursor();
-    void writeRam(uint8_t ram_cmd);
+    void writeRam(uint8_t ram_cmd, const uint8_t* buf);
     esp_err_t activate(uint8_t update_ctrl2);
 
     Pins pins_;
     spi_host_device_t host_;
     spi_device_handle_t dev_ = nullptr;
     bool bus_inited_ = false;
+    uint8_t* prev_ = nullptr;  // copy of what the panel currently shows
     uint8_t* fb_ = nullptr;  // native layout, bit 1 = white
     Rotation rotation_ = Rotation::Portrait;
     bool baseline_valid_ = false;

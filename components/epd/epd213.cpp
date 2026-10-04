@@ -13,6 +13,7 @@ namespace epd {
 
 static const char* TAG = "epd213";
 
+
 // SSD1680 commands used here
 namespace cmd {
 constexpr uint8_t DRIVER_OUTPUT = 0x01;
@@ -25,6 +26,7 @@ constexpr uint8_t DISPLAY_UPDATE_CTRL1 = 0x21;
 constexpr uint8_t DISPLAY_UPDATE_CTRL2 = 0x22;
 constexpr uint8_t WRITE_RAM_BW = 0x24;   // "new" image
 constexpr uint8_t WRITE_RAM_RED = 0x26;  // "previous" image (used by partial)
+constexpr uint8_t WRITE_LUT = 0x32;
 constexpr uint8_t BORDER_WAVEFORM = 0x3C;
 constexpr uint8_t RAM_X_RANGE = 0x44;
 constexpr uint8_t RAM_Y_RANGE = 0x45;
@@ -146,12 +148,16 @@ Epd213::~Epd213() {
         spi_bus_free(host_);
     }
     heap_caps_free(fb_);
+    heap_caps_free(prev_);
 }
 
 esp_err_t Epd213::begin() {
     fb_ = static_cast<uint8_t*>(heap_caps_malloc(kBufSize, MALLOC_CAP_DMA));
     ESP_RETURN_ON_FALSE(fb_, ESP_ERR_NO_MEM, TAG, "framebuffer alloc failed");
     memset(fb_, 0xFF, kBufSize);
+    prev_ = static_cast<uint8_t*>(heap_caps_malloc(kBufSize, MALLOC_CAP_DMA));
+    ESP_RETURN_ON_FALSE(prev_, ESP_ERR_NO_MEM, TAG, "prev buffer alloc failed");
+    memset(prev_, 0xFF, kBufSize);
 
     // Control GPIOs
     gpio_config_t out_cfg = {};
@@ -266,8 +272,10 @@ void Epd213::setRamCursor() {
     sendCmdData(cmd::RAM_Y_COUNTER, {0x00, 0x00});
 }
 
-esp_err_t Epd213::initController(uint8_t border_waveform) {
-    hwReset();
+esp_err_t Epd213::initController(uint8_t border_waveform, bool hw_reset) {
+    if (hw_reset) {
+        hwReset();
+    }
     sendCmd(cmd::SW_RESET);
     ESP_RETURN_ON_ERROR(waitBusy(), TAG, "busy after sw reset");
 
@@ -283,26 +291,55 @@ esp_err_t Epd213::initController(uint8_t border_waveform) {
     return waitBusy();
 }
 
-void Epd213::writeRam(uint8_t ram_cmd) {
+void Epd213::writeRam(uint8_t ram_cmd, const uint8_t* buf) {
     setRamCursor();
     sendCmd(ram_cmd);
-    sendData(fb_, kBufSize);
+    sendData(buf, kBufSize);
 }
 
 esp_err_t Epd213::activate(uint8_t update_ctrl2) {
     sendCmdData(cmd::DISPLAY_UPDATE_CTRL2, {update_ctrl2});
     sendCmd(cmd::MASTER_ACTIVATE);
-    return waitBusy(10000);
+    const TickType_t start = xTaskGetTickCount();
+    const esp_err_t err = waitBusy(10000);
+    ESP_LOGI(TAG, "update 0x%02X: BUSY for %u ms", update_ctrl2,
+             static_cast<unsigned>((xTaskGetTickCount() - start) * portTICK_PERIOD_MS));
+    return err;
 }
+
+// Custom partial-update waveform for the DEPG0213BN (SSD1680), uploaded with 0x32.
+// The controller's built-in mode-2 waveform is not a usable partial update on this
+// panel. Taken from the GxEPD2 driver (GxEPD2_213_BN::lut_partial).
+static const uint8_t kLutPartial[153] = {
+    0x0,  0x40, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x80, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x40, 0x40, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0A, 0x0,  0x0, 0x0, 0x0, 0x0, 0x2,
+    0x1,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0,  0x0,  0x0, 0x0, 0x0, 0x0, 0x0,
+    0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x0, 0x0, 0x0,
+};
 
 // ---- public panel ops ---------------------------------------------------------
 
 esp_err_t Epd213::refreshFull() {
     ESP_RETURN_ON_ERROR(initController(0x05), TAG, "init");
-    writeRam(cmd::WRITE_RAM_BW);
-    writeRam(cmd::WRITE_RAM_RED);  // baseline for later partial updates
+    writeRam(cmd::WRITE_RAM_BW, fb_);
+    writeRam(cmd::WRITE_RAM_RED, fb_);  // baseline for later partial updates
     // 0xF7: clock+analog on, load temp, load LUT (full mode), display, power off
     ESP_RETURN_ON_ERROR(activate(0xF7), TAG, "full update");
+    memcpy(prev_, fb_, kBufSize);
     baseline_valid_ = true;
     return ESP_OK;
 }
@@ -311,11 +348,20 @@ esp_err_t Epd213::refreshPartial() {
     if (!baseline_valid_) {
         return refreshFull();
     }
-    ESP_RETURN_ON_ERROR(initController(0x80), TAG, "init");
-    writeRam(cmd::WRITE_RAM_BW);
-    // 0xFF: same as 0xF7 but with the partial-update LUT (display mode 2)
-    ESP_RETURN_ON_ERROR(activate(0xFF), TAG, "partial update");
-    writeRam(cmd::WRITE_RAM_RED);  // new baseline = what is now on the glass
+    ESP_RETURN_ON_ERROR(initController(0x05, false), TAG, "init");
+    // New image in 0x24, previous image in 0x26 (re-sent: a reset may drop it)
+    writeRam(cmd::WRITE_RAM_RED, prev_);
+    writeRam(cmd::WRITE_RAM_BW, fb_);
+    sendCmd(cmd::WRITE_LUT);
+    sendData(kLutPartial, sizeof(kLutPartial));
+    // 0xCC: clock+analog on, display mode 2 with the LUT uploaded above (no temp/LUT load)
+    ESP_RETURN_ON_ERROR(activate(0xCC), TAG, "partial update");
+    // Power the analog supply down again
+    sendCmdData(cmd::DISPLAY_UPDATE_CTRL2, {0x83});
+    sendCmd(cmd::MASTER_ACTIVATE);
+    ESP_RETURN_ON_ERROR(waitBusy(), TAG, "partial power off");
+    writeRam(cmd::WRITE_RAM_RED, fb_);  // new baseline = what is now on the glass
+    memcpy(prev_, fb_, kBufSize);
     return ESP_OK;
 }
 
